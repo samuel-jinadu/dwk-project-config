@@ -9,7 +9,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: emulator-smoke-${{ github.event.workflow_run.head_branch || github.ref }}
+  group: emulator-smoke-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

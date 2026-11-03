@@ -1,53 +1,38 @@
 name: Deploy to GKE
 
 on:
-  workflow_run:
-    workflows: ["Publish image to GHCR"]
-    types: [completed]
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: deploy-gke-${{ github.event.workflow_run.head_branch || github.event.workflow_run.head_sha }}
+  group: deploy-gke-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    if: |
-      vars.DISABLE_GKE_DEPLOY != 'true' &&
-      github.event.workflow_run.conclusion == 'success'
+    if: vars.DISABLE_GKE_DEPLOY != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
+      # drop the `ref:` override; checkout the pushed tag automatically
 
       - name: Compute deployment target
         id: target
         run: |
-          BRANCH="${{ github.event.workflow_run.head_branch }}"
-          SHA="${{ github.event.workflow_run.head_sha }}"
-
-          if [ -z "$BRANCH" ]; then
-            # workflow_run triggered by a tag push - head_branch is empty
-            TAG=$(git tag --points-at "$SHA" | head -1)
-            if [ -z "$TAG" ]; then
-              echo "::warning::Empty branch and no tag at $SHA; defaulting to staging/main"
-              NS="staging"; IMG_TAG="main"
-            else
-              NS="production"; IMG_TAG="$TAG"
-            fi
-          elif [ "$BRANCH" = "main" ]; then
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${TAG}" = "main" ]; then
             NS="staging"; IMG_TAG="main"
           else
-            NS="$BRANCH"; IMG_TAG="$BRANCH"
+            NS="production"; IMG_TAG="${TAG}"
           fi
-
-          echo "ns=$NS"      >> "$GITHUB_OUTPUT"
-          echo "tag=$IMG_TAG" >> "$GITHUB_OUTPUT"
+          echo "ns=$NS"        >> "$GITHUB_OUTPUT"
+          echo "tag=$IMG_TAG"  >> "$GITHUB_OUTPUT"
           echo "::notice::Deploying to ns=$NS with tag=$IMG_TAG"
 
       - name: Check GCP credentials
