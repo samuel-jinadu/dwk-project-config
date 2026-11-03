@@ -1,0 +1,99 @@
+name: Deploy to GKE
+
+on:
+  workflow_run:
+    workflows: ["Publish image to GHCR"]
+    types: [completed]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-gke-${{ github.event.workflow_run.head_branch || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: |
+      vars.DISABLE_GKE_DEPLOY != 'true' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Compute deployment target
+        id: target
+        run: |
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          SHA="${{ github.event.workflow_run.head_sha }}"
+
+          if [ -z "$BRANCH" ]; then
+            # workflow_run triggered by a tag push - head_branch is empty
+            TAG=$(git tag --points-at "$SHA" | head -1)
+            if [ -z "$TAG" ]; then
+              echo "::warning::Empty branch and no tag at $SHA; defaulting to staging/main"
+              NS="staging"; IMG_TAG="main"
+            else
+              NS="production"; IMG_TAG="$TAG"
+            fi
+          elif [ "$BRANCH" = "main" ]; then
+            NS="staging"; IMG_TAG="main"
+          else
+            NS="$BRANCH"; IMG_TAG="$BRANCH"
+          fi
+
+          echo "ns=$NS"      >> "$GITHUB_OUTPUT"
+          echo "tag=$IMG_TAG" >> "$GITHUB_OUTPUT"
+          echo "::notice::Deploying to ns=$NS with tag=$IMG_TAG"
+
+      - name: Check GCP credentials
+        id: gcp
+        run: |
+          if [ -z "${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || \
+             [ -z "${{ secrets.GCP_SERVICE_ACCOUNT }}" ]; then
+            echo "::notice::No GCP credentials configured — deploy skipped."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to Google Cloud
+        if: steps.gcp.outputs.skip == 'false'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:           ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        if: steps.gcp.outputs.skip == 'false'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get GKE credentials
+        if: steps.gcp.outputs.skip == 'false'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: dwk-cluster
+          location:     europe-north1-b
+
+      - name: Install sops
+        if: steps.gcp.outputs.skip == 'false'
+        run: |
+          VER=$(curl -s https://api.github.com/repos/getsops/sops/releases/latest | grep tag_name | cut -d'"' -f4)
+          curl -sL "https://github.com/getsops/sops/releases/download/${VER}/sops_${VER#v}_amd64.deb" -o /tmp/sops.deb
+          sudo dpkg -i /tmp/sops.deb
+
+      - name: Deploy
+        if: steps.gcp.outputs.skip == 'false'
+        env:
+          SOPS_AGE_KEY:    ${{ secrets.SOPS_AGE_KEY }}
+          TARGET_NS:       ${{ steps.target.outputs.ns }}
+          TARGET_TAG:      ${{ steps.target.outputs.tag }}
+          GITOPS_REPO_URL: https://github.com/${{ github.repository }}.git
+          GITOPS_REVISION: main    # log-output keeps tracking main
+        run: |
+          chmod +x deploy-gke.sh
+          ./deploy-gke.sh
